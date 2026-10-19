@@ -11,14 +11,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
-# --- Логирование ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# --- Конфигурация ---
+# --- Конфиг ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Не найден BOT_TOKEN!")
@@ -27,7 +26,7 @@ PORT = int(os.getenv("PORT", 8000))
 RENDER_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", RENDER_HOST)
 if not WEBHOOK_HOST:
-    raise ValueError("Не удалось определить хост для webhook (RENDER_EXTERNAL_HOSTNAME пуст)")
+    raise ValueError("Не удалось определить хост для webhook")
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -62,7 +61,7 @@ def make_keyboard(number: int) -> InlineKeyboardMarkup:
     b.adjust(2)
     return b.as_markup()
 
-# --- Обработчики ---
+# --- Handlers ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     reset_user(message.from_user.id)
@@ -83,7 +82,6 @@ async def handle_text(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
     data = get_user_data(user_id)
-
     if not data:
         return
 
@@ -150,7 +148,6 @@ async def webhook_handler(request: web.Request):
         logger.info(f"📥 Webhook получен: update_id={uid}")
         update = types.Update(**update_data)
         await dp.feed_update(bot, update)
-        logger.info(f"✅ Update {uid} обработан")
     except Exception as e:
         logger.exception(f"❌ Ошибка обработки вебхука: {e}")
     return web.Response(status=200)
@@ -158,18 +155,42 @@ async def webhook_handler(request: web.Request):
 async def health(request: web.Request):
     return web.Response(text="OK")
 
+async def webhook_keeper():
+    """
+    Каждые 60 секунд проверяет, что вебхук указывает на нас.
+    Если кто-то его снёс (например, старый инстанс при SIGTERM) — восстанавливает.
+    """
+    while True:
+        try:
+            info = await bot.get_webhook_info()
+            if info.url != WEBHOOK_URL:
+                logger.warning(f"⚠️ Webhook потерян (url={info.url!r}), восстанавливаю…")
+                await bot.set_webhook(WEBHOOK_URL)
+                logger.info(f"✅ Webhook восстановлен: {WEBHOOK_URL}")
+        except Exception as e:
+            logger.error(f"webhook_keeper error: {e}")
+        await asyncio.sleep(60)
+
 async def on_startup(app: web.Application):
-    # Сначала удаляем возможный старый вебхук, чтобы не было конфликтов
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Ставим вебхук. drop_pending_updates=False, чтобы не потерять старые сообщения.
     await bot.set_webhook(WEBHOOK_URL)
     me = await bot.get_me()
     logger.info(f"🤖 Бот @{me.username} (id={me.id}) запущен")
     logger.info(f"🔗 Webhook: {WEBHOOK_URL}")
+    app["keeper_task"] = asyncio.create_task(webhook_keeper())
 
 async def on_shutdown(app: web.Application):
-    await bot.delete_webhook()
+    # ❗ ВАЖНО: НЕ вызываем bot.delete_webhook() — при передеплое старый инстанс
+    # снесёт вебхук у нового, и бот перестанет получать апдейты.
+    task = app.get("keeper_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await bot.session.close()
-    logger.info("Webhook удалён, бот остановлен")
+    logger.info("Бот остановлен (вебхук сохранён)")
 
 if __name__ == "__main__":
     app = web.Application()
